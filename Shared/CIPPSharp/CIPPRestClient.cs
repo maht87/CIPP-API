@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -57,9 +58,10 @@ namespace CIPP
     //   AdminPlane      5   admin.microsoft.com, reports, Defender, etc.
     //   Compliance      5   compliance redirect discovery (no-redirect)
     //   PartnerCenter   5   api.partnercenter.microsoft.com
+    //   DNS             2   dns.google.com, cloudflare-dns.com (per host)
     //   Default         5   catch-all + absorbs legacy Invoke-RestMethod calls
     //   ─────────────
-    //   Total          75   leaves a 50-port buffer for the Functions host,
+    //   Total          79   leaves a 46-port buffer for the Functions host,
     //                       Durable extension, AppInsights, Azure SDK clients,
     //                       and any stragglers that bypass the pool.
     //
@@ -111,6 +113,7 @@ namespace CIPP
         private static HttpClient? _complianceClient;
         private static HttpClient? _partnerCenterClient;
         private static HttpClient? _adminPlaneClient;
+        private static HttpClient? _dnsClient;
         private static HttpClient? _defaultClient;
 
         /// <summary>
@@ -266,6 +269,24 @@ namespace CIPP
         }) { Timeout = Timeout.InfiniteTimeSpan };
 
         /// <summary>
+        /// DNS client — dedicated lane for DoH (DNS-over-HTTPS) providers.
+        /// Covers dns.google.com and cloudflare-dns.com. These services
+        /// heavily load-balance across many server IPs, so a low per-server
+        /// cap avoids spreading connections across dozens of backends.
+        /// Cap: 2 connections per server.
+        /// </summary>
+        private static HttpClient BuildDnsClient() => new HttpClient(new SocketsHttpHandler
+        {
+            AutomaticDecompression         = DecompressionMethods.All,
+            PooledConnectionLifetime       = TimeSpan.FromMinutes(30),
+            PooledConnectionIdleTimeout    = TimeSpan.FromMinutes(2),
+            EnableMultipleHttp2Connections = false,
+            AllowAutoRedirect              = true,
+            MaxAutomaticRedirections       = 5,
+            MaxConnectionsPerServer        = 2,
+        }) { Timeout = Timeout.InfiniteTimeSpan };
+
+        /// <summary>
         /// Default catch-all client — handles any hostname not matched by the
         /// routing switch, including unknown Microsoft endpoints and any
         /// third-party APIs called via this wrapper.
@@ -301,6 +322,7 @@ namespace CIPP
                 _complianceClient is not null &&
                 _partnerCenterClient is not null &&
                 _adminPlaneClient is not null &&
+                _dnsClient        is not null &&
                 _defaultClient    is not null)
                 return;
 
@@ -316,6 +338,7 @@ namespace CIPP
                     _complianceClient = BuildComplianceClient();
                     _partnerCenterClient = BuildPartnerCenterClient();
                     _adminPlaneClient = BuildAdminPlaneClient();
+                    _dnsClient        = BuildDnsClient();
                     _defaultClient    = BuildDefaultClient();
                 }
             }
@@ -400,7 +423,13 @@ namespace CIPP
                 // Rule 6 — Microsoft admin/reporting/security lanes
                 var h when IsAdminPlaneHost(h)                             => (_adminPlaneClient!, "AdminPlane", host),
 
-                // Rule 7 — catch-all
+                // Rule 7 — DNS-over-HTTPS providers (low connection cap)
+                var h when h.Equals("dns.google.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_dnsClient!, "DNS", host),
+                var h when h.Equals("cloudflare-dns.com",
+                    StringComparison.OrdinalIgnoreCase)                    => (_dnsClient!, "DNS", host),
+
+                // Rule 8 — catch-all
                 _                                                           => (_defaultClient!, "Default", host),
             };
         }
@@ -536,13 +565,11 @@ namespace CIPP
 
                 request.Content = new StringContent(body, encoding, mediaTypePart);
 
-                // Re-apply the full Content-Type (including charset) because
-                // StringContent's constructor strips parameters on some runtimes
-                if (ctParts.Length > 1)
-                {
-                    request.Content.Headers.Remove("Content-Type");
-                    request.Content.Headers.TryAddWithoutValidation("Content-Type", effectiveCt);
-                }
+                // Re-apply the exact Content-Type the caller specified.
+                // StringContent's constructor auto-appends "; charset=utf-8"
+                // which breaks APIs that require a bare media type (e.g. "text/css").
+                request.Content.Headers.Remove("Content-Type");
+                request.Content.Headers.TryAddWithoutValidation("Content-Type", effectiveCt);
             }
 
             // Apply any deferred content headers (e.g. Content-Encoding)
@@ -583,9 +610,33 @@ namespace CIPP
             using (response)
             {
                 var statusCode = (int)response.StatusCode;
-                var content    = response.Content is not null
-                    ? await response.Content.ReadAsStringAsync(token).ConfigureAwait(false)
-                    : string.Empty;
+
+                // Read the body defensively. With AutomaticDecompression enabled, ReadAsStringAsync can throw
+                // (InvalidDataException "...unsupported compression method", IOException, ...) when a response
+                // carries a Content-Encoding the handler cannot decode or a malformed/mislabeled body. Such a
+                // read failure must NOT mask the HTTP status: for an error response we surface the status code
+                // (the actionable signal - e.g. a 403 from EXO), and for a success response we surface a clear,
+                // attributable error instead of an opaque decompression exception. Callers that skip the error
+                // check (e.g. redirect / compliance-URL discovery) keep their headers and fall back to an empty body.
+                string content;
+                try
+                {
+                    content = response.Content is not null
+                        ? await response.Content.ReadAsStringAsync(token).ConfigureAwait(false)
+                        : string.Empty;
+                }
+                catch (Exception ex) when (ex is InvalidDataException || ex is IOException)
+                {
+                    if (!(skipErrorCheck || noRedirect))
+                    {
+                        TrackPoolResult(selection.Pool, response.IsSuccessStatusCode, statusCode);
+                        var readFailMessage = !response.IsSuccessStatusCode
+                            ? $"Response status code does not indicate success: {statusCode}"
+                            : $"Failed to read response body (status {statusCode}): {ex.Message}";
+                        throw new HttpRequestException(readFailMessage, ex, response.StatusCode);
+                    }
+                    content = string.Empty;
+                }
 
             // ----------------------------------------------------------
             // Response headers
